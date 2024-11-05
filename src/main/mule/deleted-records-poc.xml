@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="09e834e3-e060-4247-9135-a6e0a803579a" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+		<db:config name="Database_Config" doc:name="Database Config" doc:id="dfe6211b-e9a6-4a0e-84b0-21bebec234f7" >
+		<db:generic-connection url="jdbc:redshift://10.100.33.190:5439/planstinvault_loc" user="admin" password="(?zS%5`2%L=Poq7P" driverClassName="com.amazon.redshift.jdbc42.Driver"/>
+	</db:config>
+	<configuration-properties doc:name="Configuration properties" doc:id="37cec074-1f4d-4663-947a-7762fcd9d461" file="properties\config.yaml" />
+	<flow name="deleted-records-zh-stg" doc:id="50da9a57-cb4a-41ea-9985-a193d6d85629" >
+		<http:listener doc:name="Listener" doc:id="d60fb414-7cae-431a-a4af-6e6e3b56b39c" config-ref="HTTP_Listener_config" path="/test"/>
+		<http:request method="POST" doc:name="generate access token" doc:id="90238b96-26e6-4009-b4ce-2c4d19e3fd03" url="https://accounts.zoho.com:443/oauth/v2/token?refresh_token=1000.3deee81fbb1fc7118a9ceb0df1c4bcc0.76841c23c097145412d654fd7ffb42a7&amp;client_id=1000.BTOQ5VGLAM4LQ47V0JWJ8PLI3881FA&amp;client_secret=21c7ac1e2d36efdb29b8477da15ed8aad78b15cd2b&amp;grant_type=refresh_token" target="accessToken" targetValue="#[payload.access_token]" />
+		<db:select doc:name="Select" doc:id="6a1ca06b-30ee-4cec-8494-fc3d6b833363" config-ref="Database_Config" target="zohoModuleList" targetValue="#[payload.table_nm]">
+			<db:sql ><![CDATA[select * from dw_sys.dw_deleted_records_metadata ddrm where active_flg = true]]></db:sql>
+		</db:select>
+		<foreach doc:name="For Each" doc:id="34f8e4af-7de4-49ce-aa1a-d684762817fe" collection="#[vars.zohoModuleList]">
+			<set-variable value="#[payload]" doc:name="zohoModuleName" doc:id="0b7d94c9-75bc-4c9e-bbea-1494b002df87" variableName="zohoModuleName"/>
+			<ee:transform doc:name="Transform Message" doc:id="a4d50a2d-15f2-4f7f-8738-f134b6f0bd7d">
+			<ee:message>
+			</ee:message>
+				<ee:variables >
+					<ee:set-variable variableName="watermark" ><![CDATA[import * from dw::core::Strings
+fun GetWatermark_Script(tableName:String) = 
+(
+	replaceAll("select coalesce(max(dw_load_dts), '1900-01-01') watermark from zh_stg.deleted_records where table_nm = '{table_name}'", 
+		
+		"{table_name}", tableName)
+)
+---
+GetWatermark_Script(vars.zohoModuleName)]]></ee:set-variable>
+				</ee:variables>
+		</ee:transform>
+			<db:select doc:name="Select" doc:id="69c238c5-3c18-439a-bdc7-a94674a7c62f" config-ref="Database_Config" target="watermark" targetValue="#[payload.watermark[0]]">
+				<db:sql><![CDATA[#[vars.watermark]]]></db:sql>
+			</db:select>
+			<http:request method="GET" doc:name="Request" doc:id="278ce793-deb0-4b4a-84f7-394ac7711b7b" url='#["https://www.zohoapis.com/crm/v7/" ++ vars.zohoModuleName ++ "/deleted?type=all"]'>
+				<http:headers ><![CDATA[#[output application/java
+---
+{
+	"Authorization": "Zoho-oauthtoken " ++ vars.accessToken
+	
+	}]]]></http:headers>
+			</http:request>
+			<ee:transform doc:name="Transform Message" doc:id="af6322b6-fb4c-4307-ba26-2a5ca3ca77ab" >
+				<ee:message >
+				</ee:message>
+				<ee:variables >
+					<ee:set-variable variableName="zohoResponsePayload" ><![CDATA[%dw 2.0
+output application/json
+---
+(vars.zohoResponsePayload default []) ++
+((payload.data filter ((item, index) -> (item.deleted_time as DateTime) > (vars.watermark as DateTime)
+)) map ((item, index) ->{
+   "table_nm": vars.zohoModuleName,
+   "record_id": item.id,
+   "deleted_dts": (item.deleted_time as DateTime) as String {format: "YYYY-MM-dd HH:mm:ss"},
+   "dw_load_dts": now() as String { format: "YYYY-MM-dd HH:mm:ss"},
+   "dw_source_cd": "ZH",
+   "dw_id": item.id,
+  "dw_type": vars.zohoModuleName
+} ))]]></ee:set-variable>
+				</ee:variables>
+			</ee:transform>
+		</foreach>
+		<logger level="INFO" doc:name="Logger" doc:id="64c5c9e7-702d-45f2-a692-44169dfc36e8" message="#[vars.zohoResponsePayload]"/>
+		<db:bulk-insert doc:name="Bulk insert" doc:id="28e99555-45ca-4225-99bf-ad3f45ac14ca" config-ref="Database_Config">
+			<db:bulk-input-parameters ><![CDATA[#[vars.zohoResponsePayload]]]></db:bulk-input-parameters>
+			<db:sql ><![CDATA[INSERT INTO zh_stg.deleted_records (
+   table_nm,
+   record_id,
+   deleted_dts,
+   dw_load_dts,
+   dw_source_cd,
+   dw_id,
+   dw_type
+) VALUES (
+   :table_nm,
+   :record_id,
+   :deleted_dts,
+   :dw_load_dts,
+   :dw_source_cd,
+   :dw_id,
+   :dw_type
+)]]></db:sql>
+		</db:bulk-insert>
+	</flow>
+</mule>
